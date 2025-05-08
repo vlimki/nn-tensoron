@@ -6,7 +6,6 @@ use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
 
-
 use tensoron::{tensor, ops::ML, Tensor, Matrix};
 
 pub type R = f32;
@@ -75,6 +74,21 @@ impl Network {
         }
     }
 
+    pub fn forward(&mut self, x: Matrix<R>) -> Vec<Matrix<R>> {
+        let mut acc = x;
+        let mut things = vec![];
+
+        for l in self.layers.iter() {
+            let z = &(&l.weights * &acc) + &l.biases;
+            let a = l.activation.activate(z);
+            acc = a.clone();
+            things.push(a);
+        }
+
+        let data = things.into_iter().map(|x| x.cpu()).collect();
+        data
+    }
+
     pub fn fit(&mut self, x: Matrix<R>) {
         let sizes: Vec<usize> = self.layers.iter().map(|l| l.sz).collect();
 
@@ -97,12 +111,12 @@ fn main() {
     ]).map(|x| *x as f32);
 
     let sample = xor_input.view().slice([1]).to_tensor().transpose().cpu();
-    println!("{:#?}", sample);
-
     let f = Box::new(Sigmoid);
 
     let mut net = Network::new(vec![4, 1], vec![f.clone(), f]);
-    net.fit(tensor!([2, 1][1.0f32, 0.0]));
+    net.fit(sample.clone());
 
     println!("{:#?}", net);
+
+    println!("{:#?}", net.forward(sample));
 }
