@@ -100,6 +100,14 @@ impl Network {
             layer.biases = biases;
         }
     }
+
+    /*pub fn backprop(&mut self, outputs: Vec<Matrix<R>>, target: Matrix<R>) {
+        let last = self.layers.last().unwrap();
+        let mut deltas: Vec<Matrix<R>> = Vec::with_capacity(self.layers.len());
+
+        let output = outputs.last().unwrap().clone();
+        let output_error = (output - &target).scale(last.activation.derivative(output));
+    }*/
 }
 
 fn main() {
