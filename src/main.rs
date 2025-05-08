@@ -1,4 +1,11 @@
+#![feature(generic_const_exprs, core_intrinsics)]
+
 use std::iter::zip;
+use rand::distr::Uniform;
+use rand::rngs::StdRng;
+use rand::Rng;
+use rand::SeedableRng;
+
 
 use tensoron::{tensor, ops::ML, Tensor, Matrix};
 
@@ -9,6 +16,7 @@ pub trait Activation {
     fn derivative(&self, m: Matrix<R>) -> Matrix<R>;
 }
 
+#[derive(Debug, Clone)]
 pub struct Sigmoid;
 
 impl Activation for Sigmoid {
@@ -28,9 +36,23 @@ pub struct Layer
     sz: usize,
 }
 
-impl Layer {
+impl std::fmt::Debug for Layer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Layer(\n\tweights = {:#?},\n\tbiases = {:#?}\n)", self.weights, self.biases)
+    }
 }
 
+// n = layer size, m = size of previous layer (size of input data for the first layer)
+fn xavier_init(n: usize, m: usize) -> Tensor<R, 2> {
+    let limit = 2.0f32.sqrt() / (n as f32);
+    let mut rng = StdRng::from_os_rng();
+    let uniform = Uniform::new(-limit, limit).unwrap();
+
+    let values = (0..n * m).map(|_| rng.sample(&uniform)).collect();
+    Tensor::from(([n, m], values))
+}
+
+#[derive(Debug)]
 pub struct Network {
     layers: Vec<Layer>
 }
@@ -52,6 +74,35 @@ impl Network {
             layers
         }
     }
+
+    pub fn fit(&mut self, x: Matrix<R>) {
+        let sizes: Vec<usize> = self.layers.iter().map(|l| l.sz).collect();
+
+        for (idx, layer) in self.layers.iter_mut().enumerate() {
+            let sz_prev = if idx == 0 { x.shape()[0] } else { sizes[idx - 1] };
+            let weights = xavier_init(layer.sz, sz_prev);
+            let biases = xavier_init(layer.sz, 1);
+            layer.weights = weights;
+            layer.biases = biases;
+        }
+    }
 }
 
-fn main() {}
+fn main() {
+    let xor_input = tensor!([4,2][
+        0, 0,
+        1, 0,
+        0, 1,
+        1, 1
+    ]).map(|x| *x as f32);
+
+    let sample = xor_input.view().slice([1]).to_tensor().transpose().cpu();
+    println!("{:#?}", sample);
+
+    let f = Box::new(Sigmoid);
+
+    let mut net = Network::new(vec![4, 1], vec![f.clone(), f]);
+    net.fit(tensor!([2, 1][1.0f32, 0.0]));
+
+    println!("{:#?}", net);
+}
