@@ -101,13 +101,43 @@ impl Network {
         }
     }
 
-    /*pub fn backprop(&mut self, outputs: Vec<Matrix<R>>, target: Matrix<R>) {
+    fn calculate_delta(layer: &Layer, input: &Matrix<R>, next: &Layer, delta_next: &Matrix<R>) -> Matrix<R> {
+        let wt = next.weights.transpose() * delta_next;
+        wt.scale(layer.activation.derivative(input))
+    }
+
+    fn backprop(&mut self, outputs: Vec<Matrix<R>>, target: Matrix<R>) {
         let last = self.layers.last().unwrap();
-        let mut deltas: Vec<Matrix<R>> = Vec::with_capacity(self.layers.len());
+        let n = self.layers.len();
+        let mut deltas: Vec<Matrix<R>> = Vec::with_capacity(n);
 
         let output = outputs.last().unwrap().clone();
         let output_error = (output - &target).scale(last.activation.derivative(output));
-    }*/
+        deltas.push(output_error);
+
+        for i in (1..n).rev() {
+            let delta = Self::calculate_delta(&self.layers[i-1], &outputs[i], &self.layers[i], deltas.last().unwrap());
+            deltas.push(delta);
+        }
+
+        deltas.reverse();
+
+        let mut grads = Vec::with_capacity(n);
+        for (i, delta) in deltas.iter().enumerate() {
+            let a_prev = &outputs[i];
+            let dw = delta * &a_prev.transpose();
+            grads.push((dw, delta.clone()))
+        }
+
+        grads
+    }
+
+    pub fn update_params(&mut self, lr: R, grads: Vec<(Matrix<R>, Matrix<R>)>) {
+        for (l, (dw, db)) in self.layers.iter_mut().zip(grads) {
+            layer.weights -= dw.scale(lr);
+            layer.biases -= db.scale(lr);
+        }
+    }
 }
 
 fn main() {
