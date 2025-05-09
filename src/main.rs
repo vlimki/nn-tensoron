@@ -1,34 +1,46 @@
 #![feature(generic_const_exprs, core_intrinsics)]
 
-use std::iter::zip;
 use rand::distr::Uniform;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use std::iter::zip;
 
-use tensoron::{tensor, ops::ML, Tensor, Matrix};
+use tensoron::ops::GpuAdd;
+use tensoron::{ops::ML, tensor, Matrix, Tensor};
 
 pub type R = f32;
 
 pub trait Activation {
-    fn activate(&self, m: Matrix<R>) -> Matrix<R>;
-    fn derivative(&self, m: Matrix<R>) -> Matrix<R>;
+    fn activate(&self, m: &Matrix<R>) -> Matrix<R>;
+    fn derivative(&self, m: &Matrix<R>) -> Matrix<R>;
 }
 
 #[derive(Debug, Clone)]
 pub struct Sigmoid;
 
 impl Activation for Sigmoid {
-    fn activate(&self, m: Matrix<R>) -> Matrix<R> {
+    fn activate(&self, m: &Matrix<R>) -> Matrix<R> {
         m.sigmoid()
     }
-    fn derivative(&self, m: Matrix<R>) -> Matrix<R> {
-        unimplemented!()
+    fn derivative(&self, m: &Matrix<R>) -> Matrix<R> {
+        m.sigmoid_derivative()
     }
 }
 
-pub struct Layer
-{
+#[derive(Debug, Clone)]
+pub struct ReLU;
+
+impl Activation for ReLU {
+    fn activate(&self, m: &Matrix<R>) -> Matrix<R> {
+        m.relu()
+    }
+    fn derivative(&self, m: &Matrix<R>) -> Matrix<R> {
+        m.relu_derivative()
+    }
+}
+
+pub struct Layer {
     weights: Matrix<R>,
     biases: Matrix<R>,
     activation: Box<dyn Activation>,
@@ -37,13 +49,17 @@ pub struct Layer
 
 impl std::fmt::Debug for Layer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Layer(\n\tweights = {:#?},\n\tbiases = {:#?}\n)", self.weights, self.biases)
+        write!(
+            f,
+            "Layer(\n\tweights = {:#?},\n\tbiases = {:#?}\n)",
+            self.weights, self.biases
+        )
     }
 }
 
 // n = layer size, m = size of previous layer (size of input data for the first layer)
 fn xavier_init(n: usize, m: usize) -> Tensor<R, 2> {
-    let limit = 2.0f32.sqrt() / (n as f32);
+    let limit = 6.0f32.sqrt() / (n as f32 + m as f32).sqrt();
     let mut rng = StdRng::from_os_rng();
     let uniform = Uniform::new(-limit, limit).unwrap();
 
@@ -53,7 +69,7 @@ fn xavier_init(n: usize, m: usize) -> Tensor<R, 2> {
 
 #[derive(Debug)]
 pub struct Network {
-    layers: Vec<Layer>
+    layers: Vec<Layer>,
 }
 
 impl Network {
@@ -68,32 +84,33 @@ impl Network {
                 sz: s,
             })
         }
-        
-        Self {
-            layers
-        }
+
+        Self { layers }
     }
 
-    pub fn forward(&mut self, x: Matrix<R>) -> Vec<Matrix<R>> {
-        let mut acc = x;
-        let mut things = vec![];
-
-        for l in self.layers.iter() {
-            let z = &(&l.weights * &acc) + &l.biases;
-            let a = l.activation.activate(z);
-            acc = a.clone();
-            things.push(a);
+    pub fn forward(&mut self, x: &Matrix<R>) -> (Vec<Matrix<R>>, Vec<Matrix<R>>) {
+        let mut acc = x.clone();
+        let mut zs = vec![acc.clone()];
+        let mut a_vec = zs.clone();
+        for layer in self.layers.iter() {
+            let z = &(&layer.weights * &acc) + &layer.biases;
+            let a = layer.activation.activate(&z);
+            acc = a;
+            zs.push(z);
+            a_vec.push(acc.clone());
         }
-
-        let data = things.into_iter().map(|x| x.cpu()).collect();
-        data
+        (zs, a_vec)
     }
 
     pub fn fit(&mut self, x: Matrix<R>) {
         let sizes: Vec<usize> = self.layers.iter().map(|l| l.sz).collect();
 
         for (idx, layer) in self.layers.iter_mut().enumerate() {
-            let sz_prev = if idx == 0 { x.shape()[0] } else { sizes[idx - 1] };
+            let sz_prev = if idx == 0 {
+                x.shape()[0]
+            } else {
+                sizes[idx - 1]
+            };
             let weights = xavier_init(layer.sz, sz_prev);
             let biases = xavier_init(layer.sz, 1);
             layer.weights = weights;
@@ -101,43 +118,99 @@ impl Network {
         }
     }
 
-    fn calculate_delta(layer: &Layer, input: &Matrix<R>, next: &Layer, delta_next: &Matrix<R>) -> Matrix<R> {
-        let wt = next.weights.transpose() * delta_next;
-        wt.scale(layer.activation.derivative(input))
-    }
+    fn backprop(
+        &mut self,
+        (zs, outputs): (Vec<Matrix<R>>, Vec<Matrix<R>>),
+        target: Matrix<R>,
+    ) -> (Vec<Matrix<R>>, Vec<Matrix<R>>) {
+        let mut delta = outputs.last().unwrap() - &target;
+        delta = delta.gpu_cmul(
+            &self
+                .layers
+                .last()
+                .unwrap()
+                .activation
+                .derivative(zs.last().unwrap()),
+        );
 
-    fn backprop(&mut self, outputs: Vec<Matrix<R>>, target: Matrix<R>) {
-        let last = self.layers.last().unwrap();
-        let n = self.layers.len();
-        let mut deltas: Vec<Matrix<R>> = Vec::with_capacity(n);
+        let mut grad_w = Vec::new();
+        let mut grad_b = Vec::new();
 
-        let output = outputs.last().unwrap().clone();
-        let output_error = (output - &target).scale(last.activation.derivative(output));
-        deltas.push(output_error);
-
-        for i in (1..n).rev() {
-            let delta = Self::calculate_delta(&self.layers[i-1], &outputs[i], &self.layers[i], deltas.last().unwrap());
-            deltas.push(delta);
+        for l in (0..self.layers.len()).rev() {
+            let a_prev = &outputs[l];
+            // weight gradient: delta · a_prev^T
+            let dw = &delta * &a_prev.transpose();
+            grad_w.push(dw);
+            grad_b.push(delta.clone());
+            if l > 0 {
+                let w = &self.layers[l].weights;
+                let prev = &w.transpose() * &delta;
+                delta = prev.gpu_cmul(&self.layers[l].activation.derivative(&zs[l]));
+            }
         }
 
-        deltas.reverse();
-
-        let mut grads = Vec::with_capacity(n);
-        for (i, delta) in deltas.iter().enumerate() {
-            let a_prev = &outputs[i];
-            let dw = delta * &a_prev.transpose();
-            grads.push((dw, delta.clone()))
-        }
-
-        grads
+        grad_w.reverse();
+        grad_b.reverse();
+        (grad_w, grad_b)
     }
 
-    pub fn update_params(&mut self, lr: R, grads: Vec<(Matrix<R>, Matrix<R>)>) {
-        for (l, (dw, db)) in self.layers.iter_mut().zip(grads) {
-            layer.weights -= dw.scale(lr);
-            layer.biases -= db.scale(lr);
+    pub fn update(&mut self, grad_w: Vec<Matrix<R>>, grad_b: Vec<Matrix<R>>, lr: R) {
+        for (idx, (dw, db)) in grad_w.iter().zip(grad_b).enumerate() {
+            self.layers[idx].weights = &self.layers[idx].weights - &dw.scale(lr);
+            self.layers[idx].biases = &self.layers[idx].biases - &db.scale(lr);
         }
     }
+
+    pub fn predict(&mut self, input: &Matrix<R>) -> Matrix<R> {
+        let outs = self.forward(input);
+        let out = outs.1.last().unwrap().clone();
+        out
+    }
+
+    pub fn train(&mut self, inputs: &[Matrix<R>], targets: &[Matrix<R>], epochs: usize, lr: R) {
+        for _ in 0..epochs {
+            let mut sum_dw: Vec<Matrix<R>> = self
+                .layers
+                .iter()
+                .map(|l| l.weights.shape())
+                .map(|s| Matrix::zeros(s))
+                .collect();
+
+            let mut sum_db: Vec<Matrix<R>> = self
+                .layers
+                .iter()
+                .map(|l| l.biases.shape())
+                .map(|s| Matrix::zeros(s))
+                .collect();
+
+            let n = inputs.len() as R;
+
+            for (x, y) in inputs.iter().zip(targets.iter()) {
+                let acts = self.forward(&x);
+                let (dw, db) = self.backprop(acts, y.clone());
+                for i in 0..sum_dw.len() {
+                    sum_dw[i] = &sum_dw[i] + &dw[i];
+                    sum_db[i] = &sum_db[i] + &db[i];
+                }
+            }
+
+            for i in 0..self.layers.len() {
+                sum_dw[i] = sum_dw[i].scale(1.0 / n);
+                sum_db[i] = sum_db[i].scale(1.0 / n);
+            }
+            self.update(sum_dw, sum_db, lr);
+        }
+    }
+}
+
+fn data_to_colvecs(d: Matrix<R>) -> Vec<Matrix<R>> {
+    let mut samples = vec![];
+    for i in 0..d.shape()[0] {
+        let sample = d.view().slice([i]).to_tensor().transpose();
+        samples.push(sample);
+    }
+
+    samples
 }
 
 fn main() {
@@ -146,15 +219,28 @@ fn main() {
         1, 0,
         0, 1,
         1, 1
-    ]).map(|x| *x as f32);
+    ])
+    .map(|x| *x as f32);
 
-    let sample = xor_input.view().slice([1]).to_tensor().transpose().cpu();
-    let f = Box::new(Sigmoid);
+    let xor_output: Matrix<R> = tensor!([4,1][
+        0.0,
+        1.0,
+        1.0,
+        0.0
+    ]);
 
-    let mut net = Network::new(vec![4, 1], vec![f.clone(), f]);
-    net.fit(sample.clone());
+    let sample_i = xor_input.view().slice([0]).to_tensor().transpose().cpu();
 
-    println!("{:#?}", net);
+    let mut net = Network::new(vec![4, 1], vec![Box::new(Sigmoid), Box::new(Sigmoid)]);
+    net.fit(sample_i.clone());
 
-    println!("{:#?}", net.forward(sample));
+    let i = data_to_colvecs(xor_input.clone());
+    let o = data_to_colvecs(xor_output);
+
+    net.train(&i, &o, 5000, 1.0);
+
+    for input in data_to_colvecs(xor_input.clone()) {
+        let out = net.predict(&input).cpu();
+        println!("Prediction: {:#?}", out);
+    }
 }

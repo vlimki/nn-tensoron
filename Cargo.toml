@@ -6,4 +6,7 @@ edition = "2024"
 [dependencies]
 itertools = "0.14.0"
 rand = "0.9.1"
-tensoron = { path = "../tensoron" }
+
+[dependencies.tensoron]
+path = "../tensoron"
+features = ["f32"]
